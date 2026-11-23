@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""Check a downloaded folder really is the MusicBrainz release you meant.
+
+  album-check FOLDER MBID
+
+Matches each MB track to a file by title (tag, else filename) and length.
+A folder can pass every sockseek filter and still be a different album
+(searching "ABBA - ABBA" returned a folder named Voulez-Vous), so run this
+before importing. Exit 0 = looks right, 1 = mismatch, 2 = error.
+"""
+import difflib
+import json
+import os
+import re
+import subprocess
+import sys
+import unicodedata
+
+CACHE = os.path.expanduser("~/.cache/album-download")
+AUDIO = {".flac", ".mp3", ".m4a", ".ogg", ".opus", ".wav", ".aiff", ".ape", ".wv"}
+
+
+def norm(s):
+    s = re.sub(r"['’‘`]", "", s)                     # you’ve == you've == youve
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode().lower()
+    raw = s
+    s = re.sub(r"\(.*?\)|\[.*?\]", " ", s)          # (remastered), [live]...
+    if not s.strip():                                # whole title bracketed: "[untitled]"
+        s = raw
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return " ".join(s.split())
+
+
+def file_info(path):
+    title, length = None, None
+    try:
+        import mutagen
+        m = mutagen.File(path, easy=True)
+        if m is not None:
+            title = (m.get("title") or [None])[0]
+            length = getattr(m.info, "length", None)
+    except Exception:
+        pass
+    if not title:  # "03 - Artist - Song Name.flac" -> "Song Name"
+        stem = os.path.splitext(os.path.basename(path))[0]
+        title = re.sub(r"^[\d\s._-]+", "", stem).split(" - ")[-1]
+    return title, length
+
+
+def main():
+    if len(sys.argv) != 3:
+        print(__doc__)
+        return 2
+    folder, mbid = os.path.abspath(os.path.expanduser(sys.argv[1])), sys.argv[2]
+    cached = os.path.join(CACHE, f"{mbid}.json")
+    if not os.path.exists(cached):
+        here = os.path.dirname(os.path.realpath(__file__))
+        subprocess.run([os.path.join(here, "mb-releases"), "--tracks", mbid], stdout=subprocess.DEVNULL, check=True)
+    rel = json.load(open(cached))
+    tracks = [(t["title"], (t.get("length") or 0) / 1000) for m in rel["media"] for t in m.get("tracks", [])]
+
+    files = sorted(os.path.join(r, f) for r, _, fs in os.walk(folder) for f in fs
+                   if os.path.splitext(f)[1].lower() in AUDIO)
+    infos = [(p, *file_info(p)) for p in files]
+    print(f"release: {rel['title']} ({len(tracks)} tracks)   folder: {len(files)} audio files")
+
+    unused = list(range(len(infos)))
+    good = 0
+    for title, mb_len in tracks:
+        best, score = None, 0.0
+        for i in unused:
+            s = difflib.SequenceMatcher(None, norm(title), norm(infos[i][1] or "")).ratio()
+            if s > score:
+                best, score = i, s
+        len_ok = None
+        if best is not None and mb_len and infos[best][2]:
+            len_ok = abs(mb_len - infos[best][2]) <= 5
+        ok = best is not None and (score >= 0.8 or (score >= 0.5 and len_ok))
+        if ok:
+            unused.remove(best)
+            good += 1
+        got = f"{infos[best][1]!r}" if best is not None else "-"
+        flag = "ok " if ok else "?? "
+        lens = f" len {'ok' if len_ok else 'off' if len_ok is False else '?'}" if best is not None else ""
+        print(f"  {flag} {title!r:45.45} <- {got:45.45} ({score:.2f}{lens})")
+    for i in unused:
+        print(f"  +   extra file: {os.path.basename(infos[i][0])}")
+
+    frac = good / len(tracks) if tracks else 0
+    verdict = frac >= 0.8 and len(files) >= len(tracks)
+    print(f"{good}/{len(tracks)} tracks matched -> {'LOOKS RIGHT' if verdict else 'MISMATCH: check before importing'}")
+    return 0 if verdict else 1
+
+
+if __name__ == "__main__":
+    sys.stdout.reconfigure(line_buffering=True)  # keep our lines in order with subprocess output
+    sys.exit(main())

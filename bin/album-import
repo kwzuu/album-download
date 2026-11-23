@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""Import a staged album into beets pinned to an MBID, mirror it, and verify.
+
+  album-import FOLDER MBID [--thresh 0.46] [--no-check]
+
+1. album-check (wrong-album guard; --no-check to skip)
+2. beets import -q --search-id MBID, then confirm the album really is in the
+   library (a -q import that loses to quiet_fallback: skip exits 0 with nothing)
+3. on a silent skip: retry once with -I and print the match distance.
+   --thresh X raises match.strong_rec_thresh for this run only; use it only
+   when you're sure the release is right (the distance tied/beat 0.45).
+4. beets convert -a -y, if the convert plugin has a dest (copies cover art
+   into the mirror; auto_keep doesn't)
+5. verify library + opus mirror + staging leftovers, print a summary.
+
+Exit: 0 ok, 1 verify problem, 2 usage/error, 3 import skipped, 4 album-check mismatch.
+"""
+import argparse
+import os
+import re
+import subprocess
+import sys
+import tempfile
+
+STAGE = os.path.expanduser(os.environ.get("ALBUM_DOWNLOAD_STAGE", "~/Downloads/soulseek"))
+AUDIO = {".flac", ".mp3", ".m4a", ".ogg", ".opus", ".wav", ".aiff", ".ape", ".wv"}
+HERE = os.path.dirname(os.path.realpath(__file__))
+
+
+def beets_paths():
+    """Library dir, convert mirror dir (or None) and import log (or None), from beets' own config."""
+    import yaml  # beets depends on PyYAML
+    r = subprocess.run([sys.executable, "-m", "beets", "config"], capture_output=True, text=True)
+    cfg = yaml.safe_load(r.stdout) or {}
+    if not cfg.get("directory"):
+        sys.exit("couldn't read 'directory' from `beet config`; is beets installed for this python3?")
+    plugins = cfg.get("plugins") or []
+    if isinstance(plugins, str):
+        plugins = plugins.split()
+    dest = (cfg.get("convert") or {}).get("dest") if "convert" in plugins else None
+    log = (cfg.get("import") or {}).get("log")
+    real = lambda p: os.path.realpath(os.path.expanduser(p)) if p else None
+    return real(cfg["directory"]), real(dest), real(log)
+
+
+LIB, OPUS, IMPORT_LOG = beets_paths()
+
+
+def beet(*args, capture=True):
+    r = subprocess.run([sys.executable, "-m", "beets", *args], capture_output=capture, text=True)
+    return r.returncode, (r.stdout or "") + (r.stderr or "")
+
+
+def items(mbid):
+    _, out = beet("ls", "-p", f"mb_albumid:{mbid}")
+    return [l for l in out.splitlines() if l.startswith("/")]
+
+
+def log_lines():
+    if not IMPORT_LOG:
+        return []
+    try:
+        with open(IMPORT_LOG) as f:
+            return f.read().splitlines()
+    except FileNotFoundError:
+        return []
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("folder")
+    ap.add_argument("mbid")
+    ap.add_argument("--thresh", type=float, help="one-off match.strong_rec_thresh override")
+    ap.add_argument("--no-check", action="store_true")
+    a = ap.parse_args()
+
+    folder = os.path.realpath(os.path.expanduser(a.folder))
+    if not os.path.isdir(folder):
+        print(f"no such folder: {folder}")
+        return 2
+    if folder == LIB or folder.startswith(LIB + "/"):
+        print("folder is inside the beets library; import from the staging dir instead")
+        return 2
+
+    if not a.no_check:
+        print("== album-check")
+        if subprocess.run([os.path.join(HERE, "album-check"), folder, a.mbid]).returncode != 0:
+            print("album-check failed: wrong album or incomplete. Re-run with --no-check only if you're sure.")
+            return 4
+
+    log_before = len(log_lines())
+    if items(a.mbid):
+        print("== already in library (mb_albumid matches); skipping import")
+    else:
+        print("== import")
+        base = ["import", "-q", "--search-id", a.mbid, folder]
+        beet(*base, capture=False)
+        if not items(a.mbid):
+            print("== import skipped silently; retrying with -I to see the distance")
+            _, out = beet("-vv", "import", "-q", "-I", "--search-id", a.mbid, folder)
+            for l in out.splitlines():
+                if re.search(r"distance|Success|Skipping|recommendation", l, re.I):
+                    print("   " + l)
+            if not items(a.mbid) and a.thresh:
+                print(f"== retry with strong_rec_thresh {a.thresh}")
+                with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as t:
+                    t.write(f"match:\n    strong_rec_thresh: {a.thresh}\n")
+                beet("--config", t.name, "import", "-q", "-I", "--search-id", a.mbid, folder, capture=False)
+                os.unlink(t.name)
+            if not items(a.mbid):
+                print("IMPORT SKIPPED. If the release is right and the distance is just over 0.45, "
+                      "re-run with --thresh <distance + 0.01>. See 'A skipped import' in SKILL.md.")
+                return 3
+
+    if OPUS:
+        print("== convert (cover art into the mirror)")
+        beet("convert", "-a", "-y", f"mb_albumid:{a.mbid}")
+
+    # ---- verify
+    problems = []
+    paths = items(a.mbid)
+    _, info = beet("ls", "-a", "-f", "$albumartist | $album | $year | $albumtotal tracks", f"mb_albumid:{a.mbid}")
+    print(f"\n== {info.strip()}")
+    libdirs = sorted({os.path.dirname(os.path.realpath(p)) for p in paths})  # LIB is a realpath too
+    for d in libdirs:
+        fs = sorted(os.listdir(d))
+        aud = [f for f in fs if os.path.splitext(f)[1].lower() in AUDIO]
+        print(f"library: {d}\n   {len(aud)} audio, other: {', '.join(f for f in fs if f not in aud) or '-'}")
+        if any(f.lower().endswith(".opus") for f in aud):
+            problems.append("opus files in the library: convert.auto may have been enabled instead of auto_keep")
+        if not any(f.lower().startswith("cover.") for f in fs):
+            problems.append(f"no cover in {d}")
+        if not OPUS:
+            continue
+        od = OPUS + d[len(LIB):]
+        if os.path.isdir(od):
+            ofs = os.listdir(od)
+            n = sum(f.endswith(".opus") for f in ofs)
+            print(f"mirror:  {od}\n   {n} opus, cover: {'yes' if any(f.startswith('cover.') for f in ofs) else 'NO'}")
+            if n != len(aud):
+                problems.append(f"mirror has {n} opus vs {len(aud)} library tracks")
+            if not any(f.startswith("cover.") for f in ofs):
+                problems.append("mirror missing cover")
+        else:
+            problems.append(f"no mirror dir {od}")
+
+    new_log = log_lines()[log_before:]
+    skips = [l for l in new_log if l.startswith("skip")]
+    if skips:
+        problems.append("import.log has new skip lines: " + "; ".join(skips))
+
+    if os.path.isdir(folder):
+        left = sorted(os.path.relpath(os.path.join(r, f), folder) for r, _, fs in os.walk(folder) for f in fs)
+        left_audio = [f for f in left if os.path.splitext(f)[1].lower() in AUDIO]
+        print(f"staging leftovers ({folder}): {', '.join(left) or '(empty; removed)'}")
+        if not left:
+            try:  # rmdir never touches files: only empty dirs go
+                for r, ds, _ in os.walk(folder, topdown=False):
+                    os.rmdir(r)
+            except OSError as e:
+                print(f"   couldn't remove {folder}: {e}")
+        if left_audio:
+            problems.append(f"{len(left_audio)} audio file(s) still in staging: the import didn't take them")
+    others = [d for d in os.listdir(STAGE) if os.path.join(STAGE, d) != folder] if os.path.isdir(STAGE) else []
+    if others:
+        print(f"other folders in staging (left alone): {', '.join(sorted(others))}")
+
+    if problems:
+        print("\nPROBLEMS:\n  " + "\n  ".join(problems))
+        return 1
+    print("\nOK")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.stdout.reconfigure(line_buffering=True)  # keep our lines in order with subprocess output
+    sys.exit(main())

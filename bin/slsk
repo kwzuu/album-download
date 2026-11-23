@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+"""Soulseek album search/download via sockseek, with the album-download guardrails built in.
+
+  slsk preview "ARTIST - ALBUM" COUNT [-n 12] [--mp3]
+      list shared folders that pass the filters (FLAC first, MP3>=320 if none),
+      with extras and a slsk:// link per candidate. Nothing is downloaded.
+  slsk get TARGET COUNT [--mp3]
+      TARGET is a slsk://user/folder/ link from `preview` (preferred: exactly
+      that folder), or "ARTIST - ALBUM" (sockseek picks; FLAC pass, then MP3>=320).
+
+COUNT: 13 (exact), 12-14 (range, for editions), 10+ (at least).
+
+Always: staging dir ~/Downloads/soulseek (never the beets library; override
+with $ALBUM_DOWNLOAD_STAGE), Nicotine+ must be closed, credentials read at run
+time from $SLSK_USERNAME/$SLSK_PASSWORD or else the Nicotine+ config, and
+redacted from all output. Logs go to ~/.cache/album-download/logs/.
+"""
+import argparse
+import datetime
+import json
+import os
+import re
+import subprocess
+import sys
+
+STAGE = os.path.expanduser(os.environ.get("ALBUM_DOWNLOAD_STAGE", "~/Downloads/soulseek"))
+CACHE = os.path.expanduser("~/.cache/album-download")
+NICOTINE_CFG = os.path.expanduser("~/.config/nicotine/config")
+AUDIO = {".flac", ".mp3", ".m4a", ".ogg", ".opus", ".wav", ".aiff", ".alac", ".ape", ".wv"}
+EXTRAS = {".lrc", ".cue", ".log", ".nfo", ".pdf", ".txt", ".jpg", ".jpeg", ".png"}
+
+
+def die(msg, code=2):
+    print(f"slsk: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def preflight():
+    if subprocess.run(["which", "sockseek"], capture_output=True).returncode:
+        die("sockseek not on PATH; run install.sh or see the README")
+    if subprocess.run(["pgrep", "-x", "nicotine"], capture_output=True).returncode == 0:
+        die("Nicotine+ is running; Soulseek allows one session per account. Close it first.")
+    user, pw = os.environ.get("SLSK_USERNAME"), os.environ.get("SLSK_PASSWORD")
+    if user and pw:
+        return user, pw
+    if not os.path.exists(NICOTINE_CFG):
+        die(f"no Soulseek login: set SLSK_USERNAME and SLSK_PASSWORD, or log in once with Nicotine+ ({NICOTINE_CFG})")
+    with open(NICOTINE_CFG) as f:
+        for line in f:
+            if line.startswith("login = "):
+                user = line[len("login = "):].rstrip("\n")
+            elif line.startswith("passw = "):
+                pw = line[len("passw = "):].rstrip("\n")
+    if not user or not pw:
+        die(f"no login/passw in {NICOTINE_CFG}")
+    return user, pw
+
+
+def count_args(spec):
+    m = re.fullmatch(r"(\d+)-(\d+)", spec)
+    if m:
+        return ["--min-album-track-count", m[1], "--max-album-track-count", m[2]]
+    if re.fullmatch(r"\d+[+-]?", spec):
+        return ["--album-track-count", spec]
+    die(f"bad COUNT {spec!r}: use 13, 12-14 or 10+")
+
+
+def count_ok(spec, n):
+    m = re.fullmatch(r"(\d+)-(\d+)", spec)
+    if m:
+        return int(m[1]) <= n <= int(m[2])
+    if spec.endswith("+"):
+        return n >= int(spec[:-1])
+    if spec.endswith("-"):
+        return 0 < n <= int(spec[:-1])
+    return n == int(spec)
+
+
+QUALITY = {
+    "flac": ["--format", "flac"],
+    # separate pass on purpose: --min-bitrate drops files with unknown bitrate,
+    # and many clients report none for FLAC, so a combined filter loses the FLACs.
+    "mp3": ["--format", "mp3", "--min-bitrate", "320"],
+}
+
+
+def run(user, pw, args, log=None, echo=True):
+    """Run sockseek; return (exit code, redacted output). Streams lines as they come."""
+    cmd = ["sockseek", *args, "--no-config", "--no-progress", "--user", user, "--pass", pw]
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    out = []
+    for line in p.stdout:
+        line = line.replace(pw, "<REDACTED>")
+        out.append(line)
+        if log:
+            log.write(line)
+            log.flush()
+        if echo:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+    return p.wait(), "".join(out)
+
+
+def link_for(result):
+    first = result["Files"][0]["Filename"].replace("\\", "/")
+    return f"slsk://{result['User']['Username']}/{first.rsplit('/', 1)[0]}/"
+
+
+def describe(result):
+    files = result["Files"]
+    audio = [f for f in files if os.path.splitext(f["Filename"])[1].lower() in AUDIO]
+    exts = {}
+    for f in files:
+        e = os.path.splitext(f["Filename"])[1].lower()
+        if e not in AUDIO:
+            exts[e] = exts.get(e, 0) + 1
+    fmts = sorted({os.path.splitext(f["Filename"])[1].lower().lstrip(".") for f in audio})
+    depth = {f.get("BitDepth") for f in audio if f.get("BitDepth")}
+    sr = {f.get("SampleRate") for f in audio if f.get("SampleRate")}
+    br = [f.get("Bitrate") for f in audio if f.get("Bitrate")]
+    q = []
+    if depth:
+        q.append("/".join(str(d) for d in sorted(depth)) + "bit")
+    if sr:
+        q.append("/".join(f"{s / 1000:g}" for s in sorted(sr)) + "k")
+    if br and not depth:
+        q.append(f"{min(br)}-{max(br)}kbps" if min(br) != max(br) else f"{br[0]}kbps")
+    size = sum(f.get("Size", 0) for f in files) / 1e6
+    extras = " ".join(f"{e.lstrip('.')}{'x' + str(n) if n > 1 else ''}" for e, n in sorted(exts.items()))
+    return len(audio), ",".join(fmts), " ".join(q), size, extras
+
+
+def cmd_preview(a):
+    user, pw = preflight()
+    os.makedirs(CACHE, exist_ok=True)
+    for qual in (["mp3"] if a.mp3 else ["flac", "mp3"]):
+        code, out = run(user, pw, [a.query, "-a", *count_args(a.count), *QUALITY[qual],
+                                   "--print", "json-all"], echo=False)
+        # sockseek can print log lines before the JSON and .NET stack traces after it
+        # (log lines also start with "[error]", so anchor on "[{" / "[]")
+        m = re.search(r"^\[\s*[{\]]", out, re.M)
+        try:
+            results = json.JSONDecoder().raw_decode(out, m.start())[0] if m else []
+        except json.JSONDecodeError:
+            print(out[-2000:])
+            die(f"couldn't parse sockseek output (exit {code})")
+        print(f"== {qual}: {len(results)} folder(s) for {a.query!r} count {a.count}")
+        if results:
+            break
+    if not results:
+        print("nothing complete. Relax COUNT (e.g. 10+), add a year to the query, or report what's missing.")
+        return 1
+    slug = re.sub(r"[^a-z0-9]+", "-", a.query.lower()).strip("-")[:60]
+    path = os.path.join(CACHE, f"preview-{slug}.json")
+    with open(path, "w") as f:
+        json.dump(results, f)
+    print(f"{'#':>2} {'user':18} {'speed':>6} slot {'n':>3} {'fmt':6} {'quality':14} {'MB':>6}  extras")
+    for i, r in enumerate(results[:a.n], 1):
+        n, fmts, q, size, extras = describe(r)
+        u = r["User"]
+        print(f"{i:>2} {u['Username'][:18]:18} {u.get('UploadSpeed', 0):>6.1f} {'yes ' if u.get('HasFreeUploadSlot') else 'no  '}"
+              f"{n:>3} {fmts[:6]:6} {q[:14]:14} {size:>6.0f}  {extras}")
+        print(f"   {link_for(r)}")
+        names = sorted((os.path.basename(f["Filename"].replace("\\", "/")) for f in r["Files"]
+                        if os.path.splitext(f["Filename"])[1].lower() in AUDIO),
+                       key=lambda n: [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", n)])
+        print(f"   first: {names[0] if names else '-'}   last: {names[-1] if names else '-'}")
+    if len(results) > a.n:
+        print(f"... {len(results) - a.n} more in {path}")
+    return 0
+
+
+def audio_files():
+    found = set()
+    for root, _, files in os.walk(STAGE):
+        for f in files:
+            if os.path.splitext(f)[1].lower() in AUDIO:
+                found.add(os.path.join(root, f))
+    return found
+
+
+def cmd_get(a):
+    user, pw = preflight()
+    if a.output:
+        die(f"refusing -o: downloads always stage in {STAGE} (never the beets library)")
+    os.makedirs(STAGE, exist_ok=True)
+    os.makedirs(os.path.join(CACHE, "logs"), exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    logpath = os.path.join(CACHE, "logs", f"get-{stamp}.log")
+    before = audio_files()
+    common = [*count_args(a.count), "--album-art", "largest", "-o", STAGE]
+    if a.target.startswith("slsk://"):
+        passes = [("folder", [a.target, "-a", *common])]
+    else:
+        quals = ["mp3"] if a.mp3 else ["flac", "mp3"]
+        passes = [(q, [a.target, "-a", *common, *QUALITY[q]]) for q in quals]
+    print(f"log: {logpath}", flush=True)
+    with open(logpath, "w") as log:
+        for name, args in passes:
+            print(f"== pass: {name}", flush=True)
+            log.write(f"== pass: {name}\n")
+            code, _ = run(user, pw, args, log=log)
+            new = audio_files() - before
+            dirs = {}
+            for f in new:
+                dirs.setdefault(os.path.dirname(f), []).append(f)
+            complete = {d: fs for d, fs in dirs.items() if count_ok(a.count, len(fs))}
+            if complete:
+                break
+            print(f"== pass {name}: sockseek exit {code}, no complete folder", flush=True)
+    print("\n== new audio in staging:")
+    if not dirs:
+        print("  (none)")
+        return 1
+    for d, fs in sorted(dirs.items()):
+        ok = "complete" if d in complete else "INCOMPLETE"
+        others = sorted(set(os.listdir(d)) - {os.path.basename(f) for f in fs})
+        print(f"  {len(fs):>3} audio  {ok:10}  {d}")
+        if others:
+            print(f"       + {', '.join(others)}")
+    return 0 if complete else 1
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("preview")
+    p.add_argument("query")
+    p.add_argument("count")
+    p.add_argument("-n", type=int, default=10)
+    p.add_argument("--mp3", action="store_true", help="skip the FLAC pass")
+    g = sub.add_parser("get")
+    g.add_argument("target")
+    g.add_argument("count")
+    g.add_argument("--mp3", action="store_true", help="skip the FLAC pass")
+    g.add_argument("-o", "--output", help=argparse.SUPPRESS)
+    a = ap.parse_args()
+    return cmd_preview(a) if a.cmd == "preview" else cmd_get(a)
+
+
+if __name__ == "__main__":
+    sys.stdout.reconfigure(line_buffering=True)  # keep our lines in order with subprocess output
+    sys.exit(main())
